@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
+from aura_project.alert_policy import AlertPolicy
 from aura_project.alerts import AlertManager
 from aura_project.bottleneck_analysis import BottleneckAnalyzer
 from aura_project.buffer import RollingFrameBuffer
@@ -77,6 +78,7 @@ def render_live_monitoring() -> None:
     motion: MotionAnalyzer = st.session_state.motion
     bottleneck: BottleneckAnalyzer = st.session_state.bottleneck
     alerts: AlertManager = st.session_state.alerts
+    alert_policy: AlertPolicy = st.session_state.alert_policy
     frame_buffer: RollingFrameBuffer = st.session_state.buffer
 
     detector.density_threshold = density_threshold
@@ -126,7 +128,7 @@ def render_live_monitoring() -> None:
         metrics[4].metric("Buffered Frames", len(frame_buffer))
 
         alert_msgs = []
-        if crowd.is_high_density:
+        if alert_policy.should_emit("high_density", crowd.is_high_density):
             msg = f"HIGH DENSITY ALERT: crowd density {crowd.density:.6f}"
             alert_msgs.append(msg)
             alerts.play_alarm("high_density")
