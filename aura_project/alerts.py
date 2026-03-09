@@ -21,14 +21,26 @@ class TwilioConfig:
 class AlertManager:
     """Dispatch critical alerts over multiple channels."""
 
-    def __init__(self, alarm_file: str = "alert.wav") -> None:
-        self.alarm_file = alarm_file
+    def __init__(
+        self,
+        default_alarm_file: str = "alert.wav",
+        sound_map: dict[str, str] | None = None,
+    ) -> None:
+        self.default_alarm_file = default_alarm_file
+        self.sound_map = sound_map or {}
 
-    def play_alarm(self) -> None:
-        """Play local alarm asynchronously."""
-        if not os.path.exists(self.alarm_file):
-            return
-        threading.Thread(target=playsound, args=(self.alarm_file,), kwargs={"block": True}, daemon=True).start()
+    def _play_file_if_exists(self, sound_file: str) -> bool:
+        if not sound_file or not os.path.exists(sound_file):
+            return False
+        threading.Thread(target=playsound, args=(sound_file,), kwargs={"block": True}, daemon=True).start()
+        return True
+
+    def play_alarm(self, alert_type: str = "default") -> None:
+        """Play local alarm asynchronously; fallback to terminal bell for system sound."""
+        sound_file = self.sound_map.get(alert_type, self.default_alarm_file)
+        played = self._play_file_if_exists(sound_file)
+        if not played:
+            print("\a", end="", flush=True)
 
     def console_alert(self, message: str) -> None:
         """Emit alert to terminal output."""

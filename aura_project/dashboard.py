@@ -10,7 +10,9 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
+from aura_project.alert_policy import AlertPolicy
 from aura_project.alerts import AlertManager
+from aura_project.bottleneck_analysis import BottleneckAnalyzer
 from aura_project.buffer import RollingFrameBuffer
 from aura_project.detection import CrowdDetector
 from aura_project.lost_item_search import LostItemSearcher
@@ -29,9 +31,16 @@ def init_state() -> None:
     if "detector" not in st.session_state:
         st.session_state.detector = CrowdDetector(model_path="yolov8n.pt")
     if "motion" not in st.session_state:
-        st.session_state.motion = MotionAnalyzer(movement_threshold=20.0)
+        st.session_state.motion = MotionAnalyzer(high_movement_threshold=14.0, stampede_threshold=22.0)
+    if "bottleneck" not in st.session_state:
+        st.session_state.bottleneck = BottleneckAnalyzer(concentration_threshold=0.48)
     if "alerts" not in st.session_state:
-        st.session_state.alerts = AlertManager(alarm_file="alert.wav")
+        st.session_state.alerts = AlertManager(
+            default_alarm_file="alert.wav",
+            sound_map={"high_density": "alert.wav", "high_movement": "alert.wav", "stampede": "alert.wav", "bottleneck": "alert.wav"},
+        )
+    if "alert_policy" not in st.session_state:
+        st.session_state.alert_policy = AlertPolicy(min_consecutive=3, cooldown_seconds=12.0)
     if "density_history" not in st.session_state:
         st.session_state.density_history = []
 
@@ -52,26 +61,40 @@ def log_event(event_type: str, description: str, people_count: int, density: flo
 def render_live_monitoring() -> None:
     st.title("AURA – Live Monitoring")
 
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
     with c1:
         source = st.text_input("Camera source (0 for webcam / URL for CCTV)", "0")
     with c2:
         density_threshold = st.slider("Density Threshold", min_value=0.00001, max_value=0.0005, value=0.00008, step=0.00001)
     with c3:
-        motion_threshold = st.slider("Motion Threshold", min_value=5.0, max_value=60.0, value=20.0, step=1.0)
+        high_movement_threshold = st.slider("High Movement Threshold", min_value=5.0, max_value=60.0, value=14.0, step=1.0)
+    with c4:
+        stampede_threshold = st.slider("Stampede Threshold", min_value=5.0, max_value=60.0, value=22.0, step=1.0)
+    with c5:
+        bottleneck_threshold = st.slider("Bottleneck Threshold", min_value=0.20, max_value=0.90, value=0.48, step=0.01)
+    with c6:
+        confirm_frames = st.slider("Confirm Frames", min_value=1, max_value=8, value=3, step=1)
+    with c7:
+        cooldown_sec = st.slider("Alert Cooldown (s)", min_value=1, max_value=45, value=12, step=1)
 
     run = st.toggle("Start Monitoring", value=False)
     frame_slot = st.empty()
 
     detector: CrowdDetector = st.session_state.detector
     motion: MotionAnalyzer = st.session_state.motion
+    bottleneck: BottleneckAnalyzer = st.session_state.bottleneck
     alerts: AlertManager = st.session_state.alerts
+    alert_policy: AlertPolicy = st.session_state.alert_policy
     frame_buffer: RollingFrameBuffer = st.session_state.buffer
 
     detector.density_threshold = density_threshold
-    motion.movement_threshold = motion_threshold
+    motion.high_movement_threshold = high_movement_threshold
+    motion.stampede_threshold = max(stampede_threshold, high_movement_threshold)
+    bottleneck.concentration_threshold = bottleneck_threshold
+    alert_policy.min_consecutive = confirm_frames
+    alert_policy.cooldown_seconds = float(cooldown_sec)
 
-    metrics = st.columns(4)
+    metrics = st.columns(6)
     status_slot = st.empty()
 
     if not run:
@@ -99,6 +122,7 @@ def render_live_monitoring() -> None:
 
         crowd = detector.detect(frame)
         motion_res = motion.analyze(frame)
+        bottleneck_res = bottleneck.analyze(crowd.detections, FRAME_SIZE[0])
 
         frame_buffer.add(ts, crowd.annotated_frame)
         st.session_state.density_history.append({"timestamp": ts, "density": crowd.density})
@@ -108,19 +132,37 @@ def render_live_monitoring() -> None:
         metrics[0].metric("People Count", crowd.people_count)
         metrics[1].metric("Density", f"{crowd.density:.6f}")
         metrics[2].metric("Movement Score", f"{motion_res.movement_score:.2f}")
-        metrics[3].metric("Buffered Frames", len(frame_buffer))
+        metrics[3].metric("Bottleneck Score", f"{bottleneck_res.concentration_score:.2f}")
+        risk_score = min(1.0, (crowd.density / max(detector.density_threshold, 1e-9)) * 0.35 + (motion_res.movement_score / max(motion.stampede_threshold, 1e-9)) * 0.40 + (bottleneck_res.concentration_score / max(bottleneck.concentration_threshold, 1e-9)) * 0.25)
+
+        metrics[4].metric("Risk Score", f"{risk_score:.2f}")
+        metrics[5].metric("Buffered Frames", len(frame_buffer))
 
         alert_msgs = []
-        if crowd.is_high_density:
+        if alert_policy.should_emit("high_density", crowd.is_high_density):
             msg = f"HIGH DENSITY ALERT: crowd density {crowd.density:.6f}"
             alert_msgs.append(msg)
+            alerts.play_alarm("high_density")
             log_event("HIGH_DENSITY", msg, crowd.people_count, crowd.density, motion_res.movement_score)
 
-        if motion_res.is_risk:
+        if alert_policy.should_emit("high_movement", motion_res.is_high_movement):
+            msg = f"HIGH MOVEMENT ALERT: movement score {motion_res.movement_score:.2f}"
+            alert_msgs.append(msg)
+            alerts.play_alarm("high_movement")
+            log_event("HIGH_MOVEMENT", msg, crowd.people_count, crowd.density, motion_res.movement_score)
+
+        if alert_policy.should_emit("stampede", motion_res.is_stampede_risk):
             msg = f"STAMPEDE RISK ALERT: movement score {motion_res.movement_score:.2f}"
             alert_msgs.append(msg)
-            alerts.play_alarm()
+            alerts.play_alarm("stampede")
             log_event("STAMPEDE_RISK", msg, crowd.people_count, crowd.density, motion_res.movement_score)
+
+        if alert_policy.should_emit("bottleneck", bottleneck_res.is_bottleneck):
+            zone_l, zone_r = bottleneck_res.hot_zone
+            msg = f"BOTTLENECK ALERT: concentration {bottleneck_res.concentration_score:.2f} in zone x={zone_l}-{zone_r}"
+            alert_msgs.append(msg)
+            alerts.play_alarm("bottleneck")
+            log_event("BOTTLENECK", msg, crowd.people_count, crowd.density, motion_res.movement_score)
 
         if alert_msgs:
             alert_block = " | ".join(alert_msgs)
